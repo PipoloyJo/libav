@@ -30,6 +30,7 @@
 #include "libavformat/internal.h"
 #include "libavutil/time.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/parseutils.h"
 
 #include "avdevice.h"
 
@@ -91,9 +92,15 @@ typedef struct AVFoundationCaptureContext {
     AVClass *class;
     /* AVOptions */
     int list_devices;
-    enum AVPixelFormat pixel_format;
+    int list_formats;
+    char* pixel_format;
+    char* video_size;   /* String describing video size */
+    char* framerate;    /* String describing the framerate */
+
 
     int video_stream_index;
+    int width, height;
+    AVRational internal_framerate;
 
     int64_t first_pts;
     int frames_captured;
@@ -118,6 +125,10 @@ static const AVOption options[] = {
     { "all",          "Show all the supported devices",  OFFSET(list_devices),  AV_OPT_TYPE_CONST,  {.i64 = ALL_DEVICES },   0, INT_MAX, DEC, "list_devices" },
     { "audio",        "Show only the audio devices",     OFFSET(list_devices),  AV_OPT_TYPE_CONST,  {.i64 = AUDIO_DEVICES }, 0, INT_MAX, DEC, "list_devices" },
     { "video",        "Show only the video devices",     OFFSET(list_devices),  AV_OPT_TYPE_CONST,  {.i64 = VIDEO_DEVICES }, 0, INT_MAX, DEC, "list_devices" },
+    { "list_formats", "List available formats and exit", OFFSET(list_formats),  AV_OPT_TYPE_INT,    {.i64 = 0 },             0, INT_MAX, DEC, "list_formats" },
+    { "pixel_format", "Preferred pixel format",          OFFSET(pixel_format),  AV_OPT_TYPE_STRING, {.str = NULL},           0, 0, DEC},
+    { "video_size",   "A string describing frame size, such as 640x480 or hd720.", OFFSET(video_size), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0, DEC },
+    { "framerate",    "A string representing desired framerate", OFFSET(framerate), AV_OPT_TYPE_STRING, {.str = NULL},       0, 0, DEC },
     { NULL },
 };
 
@@ -149,6 +160,23 @@ static int avfoundation_list_capture_devices(AVFormatContext *s)
     if (ctx->list_devices & VIDEO_DEVICES)
         list_capture_devices_by_type(s, AVMediaTypeVideo);
 
+    return AVERROR_EXIT;
+}
+
+static int list_formats(AVFormatContext *s)
+{
+    av_log(s, AV_LOG_VERBOSE, "Supported pixel formats (first is more efficient):\n");
+    AVCaptureVideoDataOutput* out = [[AVCaptureVideoDataOutput alloc] init];
+
+    for (NSNumber* cv_pixel_format in [out availableVideoCVPixelFormatTypes]) {
+        OSType cv_fmt = [cv_pixel_format intValue];
+        enum AVPixelFormat pix_fmt = core_video_to_pix_fmt(cv_fmt);
+        if (pix_fmt != AV_PIX_FMT_NONE) {
+            av_log(s, AV_LOG_VERBOSE, "  %s: %d\n",
+                   av_get_pix_fmt_name(pix_fmt),
+                   cv_fmt);
+        }
+    }
     return AVERROR_EXIT;
 }
 
@@ -206,6 +234,99 @@ static void unlock_frames(AVFoundationCaptureContext* ctx)
 
 @end
 
+/**
+ * Configure the video device.
+ */
+static bool configure_video_device(AVFormatContext *s, AVCaptureDevice *video_device)
+{
+    AVFoundationCaptureContext *ctx = s->priv_data;
+    AVCaptureDeviceFormat* selected_format = nil;
+    AVFrameRateRange* selected_range = nil;
+    double framerate = av_q2d(ctx->internal_framerate);
+    double epsilon = 0.00000001;
+
+    for (AVCaptureDeviceFormat* format in [video_device formats]) {
+        CMFormatDescriptionRef formatDescription;
+        CMVideoDimensions dimensions;
+
+        formatDescription = (CMFormatDescriptionRef) format.formatDescription;
+        dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
+
+        if ((ctx->width == 0 && ctx->height == 0) ||
+            (dimensions.width == ctx->width && dimensions.height == ctx->height)) {
+
+            av_log(s, AV_LOG_INFO, "Trying video size %dx%d\n",
+                dimensions.width, dimensions.height);
+            ctx->width = dimensions.width;
+            ctx->height = dimensions.height;
+            selected_format = format;
+            if (framerate) {
+                av_log(s, AV_LOG_INFO, "Checking support for framerate %f\n",
+                    framerate);
+                for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+                        if (range.minFrameRate <= (framerate + epsilon) &&
+                                range.maxFrameRate >= (framerate - epsilon)) {
+                        selected_range = range;
+                        break;
+                    }
+                }
+            } else {
+                selected_range = format.videoSupportedFrameRateRanges[0];
+                framerate = selected_range.maxFrameRate;
+                break;
+            }
+
+            if (selected_format && selected_range)
+                break;
+        }
+    }
+
+    if (!selected_format) {
+        av_log(s, AV_LOG_ERROR, "Selected video size (%dx%d) is not supported by the device\n",
+            ctx->width, ctx->height);
+        return false;
+    } else {
+        av_log(s, AV_LOG_INFO, "Setting video size to %dx%d\n",
+            ctx->width, ctx->height);
+    }
+
+    if (framerate && !selected_range) {
+        av_log(s, AV_LOG_ERROR, "Selected framerate (%f) is not supported by the device\n",
+            framerate);
+        return false;
+    } else {
+        av_log(s, AV_LOG_INFO, "Setting framerate to %f\n",
+            framerate);
+    }
+
+    if ([video_device lockForConfiguration:NULL] == YES) {
+        [video_device setActiveFormat:selected_format];
+        [video_device setActiveVideoMinFrameDuration:CMTimeMake(1, framerate)];
+        [video_device setActiveVideoMaxFrameDuration:CMTimeMake(1, framerate)];
+    } else {
+        av_log(s, AV_LOG_ERROR, "Could not lock device for configuration\n");
+        return false;
+    }
+    return true;
+}
+
+static void print_supported_formats(AVFormatContext *s, AVCaptureDevice *device)
+{
+    av_log(s, AV_LOG_WARNING, "Supported modes:\n");
+    for (AVCaptureDeviceFormat* format in [device formats]) {
+        CMFormatDescriptionRef formatDescription;
+        CMVideoDimensions dimensions;
+
+        formatDescription = (CMFormatDescriptionRef) format.formatDescription;
+        dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
+
+        for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+            av_log(s, AV_LOG_WARNING, "  %dx%d@[%f %f]fps\n",
+                dimensions.width, dimensions.height,
+                range.minFrameRate, range.maxFrameRate);
+        }
+    }
+}
 
 static int setup_stream(AVFormatContext *s, AVCaptureDevice *device)
 {
@@ -217,6 +338,13 @@ static int setup_stream(AVFormatContext *s, AVCaptureDevice *device)
     AVCaptureSession *session = (__bridge AVCaptureSession*)ctx->session;
     input = [AVCaptureDeviceInput deviceInputWithDevice:device
                                                   error:&error];
+
+    if (!configure_video_device(s, device)) {
+        av_log(s, AV_LOG_ERROR, "device configuration failed\n");
+        print_supported_formats(s, device);
+        return AVERROR(EINVAL);
+    }
+
     // add the input devices
     if (!input) {
         av_log(s, AV_LOG_ERROR, "%s\n",
@@ -235,7 +363,6 @@ static int setup_stream(AVFormatContext *s, AVCaptureDevice *device)
     if ([device hasMediaType:AVMediaTypeVideo]) {
         AVCaptureVideoDataOutput* out = [[AVCaptureVideoDataOutput alloc] init];
         NSNumber *core_video_fmt = nil;
-        enum AVPixelFormat pixel_format;
         if (!out) {
             av_log(s, AV_LOG_ERROR, "Failed to init AV video output\n");
             return AVERROR(EINVAL);
@@ -243,17 +370,27 @@ static int setup_stream(AVFormatContext *s, AVCaptureDevice *device)
 
         [out setAlwaysDiscardsLateVideoFrames:YES];
 
-        // Map the first supported pixel format
-        av_log(s, AV_LOG_VERBOSE, "Supported pixel formats:\n");
-        for (NSNumber *cv_pixel_format in [out availableVideoCVPixelFormatTypes]) {
-            OSType cv_fmt = [cv_pixel_format intValue];
-            enum AVPixelFormat pix_fmt = core_video_to_pix_fmt(cv_fmt);
-            if (pix_fmt != AV_PIX_FMT_NONE) {
-                av_log(s, AV_LOG_VERBOSE, "  %s: %d\n",
-                       av_get_pix_fmt_name(pix_fmt),
-                       cv_fmt);
-                core_video_fmt = cv_pixel_format;
-                pixel_format   = pix_fmt;
+        if (ctx->pixel_format) {
+            // Try to use specified pixel format
+            core_video_fmt = [NSNumber numberWithInt:pix_fmt_to_core_video(av_get_pix_fmt(ctx->pixel_format))];
+            if ([[out availableVideoCVPixelFormatTypes] indexOfObject:core_video_fmt] != NSNotFound) {
+                av_log(s, AV_LOG_VERBOSE, "Pixel format %s supported!\n", ctx->pixel_format);
+            } else {
+                core_video_fmt = nil;
+            }
+        }
+
+        if (!ctx->pixel_format || !core_video_fmt) {
+            av_log(s, AV_LOG_VERBOSE, "Pixel format not supported or not provided, overriding...\n");
+            for (NSNumber *cv_pixel_format in [out availableVideoCVPixelFormatTypes]) {
+                OSType cv_fmt = [cv_pixel_format intValue];
+                enum AVPixelFormat pix_fmt = core_video_to_pix_fmt(cv_fmt);
+                // Use the first one in the list, it will be the most effective
+                if (pix_fmt != AV_PIX_FMT_NONE) {
+                    core_video_fmt = cv_pixel_format;
+                    ctx->pixel_format = av_strdup(av_get_pix_fmt_name(pix_fmt));;
+                    break;
+                }
             }
         }
 
@@ -262,9 +399,9 @@ static int setup_stream(AVFormatContext *s, AVCaptureDevice *device)
             return AVERROR(EINVAL);
         } else {
             av_log(s, AV_LOG_INFO, "Using %s.\n",
-                   av_get_pix_fmt_name(pixel_format));
+                    ctx->pixel_format);
         }
-        ctx->pixel_format          = pixel_format;
+
         NSDictionary *capture_dict = [NSDictionary dictionaryWithObject:core_video_fmt
                                                                  forKey:(id)kCVPixelBufferPixelFormatTypeKey];
         [out setVideoSettings:capture_dict];
@@ -318,7 +455,7 @@ static int get_video_config(AVFormatContext *s)
     stream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
     stream->codec->width      = (int)image_buffer_size.width;
     stream->codec->height     = (int)image_buffer_size.height;
-    stream->codec->pix_fmt    = ctx->pixel_format;
+    stream->codec->pix_fmt    = av_get_pix_fmt(ctx->pixel_format);
 
     CFRelease(ctx->current_frame);
     ctx->current_frame = nil;
@@ -431,12 +568,15 @@ static int setup_streams(AVFormatContext *s)
     }
 
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "No device could be added");
+        av_log(s, AV_LOG_ERROR, "No device could be added\n");
         return ret;
     }
 
     av_log(s, AV_LOG_INFO, "Starting session!\n");
     [(__bridge AVCaptureSession*)ctx->session startRunning];
+
+    // Session is started, unlock device
+    [device unlockForConfiguration];
 
     av_log(s, AV_LOG_INFO, "Checking video config\n");
     if (get_video_config(s)) {
@@ -451,8 +591,37 @@ static int avfoundation_read_header(AVFormatContext *s)
 {
     AVFoundationCaptureContext *ctx = s->priv_data;
     ctx->first_pts = av_gettime();
+
+    AVRational framerate_q = { 0 , 1 };
+    ctx->internal_framerate = framerate_q;
+
     if (ctx->list_devices)
         return avfoundation_list_capture_devices(s);
+    if (ctx->list_formats) {
+        return list_formats(s);
+    }
+
+    if (ctx->pixel_format) {
+        if (av_get_pix_fmt(ctx->pixel_format) == AV_PIX_FMT_NONE) {
+            av_log(s, AV_LOG_ERROR, "No such input format: %s.\n",
+                   ctx->pixel_format);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    if (ctx->video_size &&
+        (av_parse_video_size(&ctx->width, &ctx->height, ctx->video_size)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Could not parse video size '%s'.\n",
+               ctx->video_size);
+        return AVERROR(EINVAL);
+    }
+
+    if (ctx->framerate &&
+        (av_parse_video_rate(&ctx->internal_framerate, ctx->framerate)) < 0) {
+        av_log(s, AV_LOG_ERROR, "Could not parse framerate '%s'.\n",
+               ctx->framerate);
+        return AVERROR(EINVAL);
+    }
 
     return setup_streams(s);
 }
